@@ -1,51 +1,48 @@
-#include "vmlinux.h"
-#include <bpf/bpf_helpers.h>
+#include <linux/bpf.h>
+#include <linux/in.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 
-#define FNAME_LEN 32
-struct exec_data_t {
-    u32 pid;u8 fname[FNAME_LEN]; //
-    u8 comm[FNAME_LEN];
+#define HTTP_FILTER_PORT 80
 
+struct http_event_t {
+    __u32 pid;
+    __u32 direction;
 };
 
-struct{
-    _uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    _uint(key_size, sizeof(u32));
-    _uint(value_size, sizeof(u32));
-}   events SEC(".maps");
+BPF_PERF_OUTPUT(http_events);
 
-struct execve_entry_args_t {
-    u64 _unused; // unused
-    u64 _unused2;
+int http_filter(struct xdp_md *ctx) {
+    void *data_end = (void*)(long)ctx->data_end;
+    void *data = (void*)(long)ctx->data;
+    struct ethhdr *eth = data;
+    struct iphdr *ip = data + sizeof(*eth);
+    __u32 saddr = ip->saddr;
+    __u32 daddr = ip->daddr;
 
-    const char* filename;
-    const char* const* argv;
-    const char* const* envp;
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = data + sizeof(*eth) + sizeof(*ip);
 
-};
+        if (tcp->dest == htons(HTTP_FILTER_PORT)) {
+            // Incoming HTTP connection
+            struct http_event_t event = {
+                .pid = bpf_get_current_pid_tgid() >> 32,
+                .direction = 0,
+            };
+            http_events.perf_submit(ctx, &event, sizeof(event));
+        }
 
-#define LAST_32_BITS(x) x & 0xFFFFFFFF
-#define FIRST_32_BITS(x) x >> 32
+        if (tcp->source == htons(HTTP_FILTER_PORT)) {
+            // Outgoing HTTP connection
+            struct http_event_t event = {
+                .pid = bpf_get_current_pid_tgid() >> 32,
+                .direction = 1,
+            };
+            http_events.perf_submit(ctx, &event, sizeof(event));
+        }
+    }
 
-SEC("tracepoint/syscalls/sys_enter_execve")
-int enter_execve(struct execve_entry_args_t *args)
-{
-    struct exec_data_t exec_data = {};
-    u64 pid_tgid;
-
-    pid_tgid = bpf_get_current_pid_tgid();
-    exec_data.pid = LAST_32_BITS(pid_tgid);
-
-    bpf_probe_read_user_str(exec_data.fname, 
-        sizeof(exec_data.fname), args->filename );
-
-    bpf_get_current_comm(exec_data.comm, sizeof(exec_data.comm));
-    
-    bpf_perf_event_output(args, &events, 
-        BPF_F_CURRENT_CPU, &exec_data, sizeof(exec_data));
-        
-    bpf_printk("hello, world \n");
-
-    return 0;    
-        
+    return XDP_PASS;
 }
